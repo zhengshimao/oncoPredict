@@ -225,7 +225,6 @@ summarizeGenesByMean <- function(exprMat)
 #'@param trainingPtype The known phenotype for "trainingExprData". This data must be a matrix of drugs/rows x cell lines/columns or cosmic ids/columns. This matrix can contain NA values, that is ok (they are removed in the calcPhenotype() function).
 #'@param testExprData The test data where the phenotype will be estimated. It is a matrix of expression levels, rows contain genes and columns contain samples, "rownames()" must be specified and must contain the same type of gene ids as "trainingExprData".
 #'@param ncore Number of threads. Default: all threads.
-#'@param report_log return logs infor or not. Default: FALSE.
 #'@param batchCorrect How should training and test data matrices be homogenized. Choices are "eb" (default) for ComBat, "qn" for quantiles normalization or "none" for no homogenization.
 #'@param powerTransformPhenotype Should the phenotype be power transformed before we fit the regression model? Default to TRUE, set to FALSE if the phenotype is already known to be highly normal.
 #'@param removeLowVaryingGenes What proportion of low varying genes should be removed? 20 percent be default
@@ -247,8 +246,7 @@ summarizeGenesByMean <- function(exprMat)
 #'@return Depends on the folder parameter. If folder = True, .txt files will be saved into a folder in your working directory automatically. The folder will include the estimated drug response values as a .txt file. Depending on the rsq, cc, report_pc parameters specified, the .txt file outputs of this function will also include
 #'the R^2 data, and the correlation coefficients and principal components are stored as .RData files for each drug in your drug dataset.
 #'If folder = 'FALSE', then only the predicted drug response values will be returned as an object.
-#'@import foreach
-#'@import doParallel
+#'@import parallel
 #'@import sva
 #'@import ridge
 #'@import car
@@ -260,11 +258,10 @@ summarizeGenesByMean <- function(exprMat)
 #'@importFrom pls explvar explvar
 #'@keywords predict drug sensitivity and phenotype
 #'@export
-calcPhenotype<-function (trainingExprData,
+calcPhenotype2<-function (trainingExprData,
                          trainingPtype,
                          testExprData,
                          ncore,
-                         report_log=FALSE,
                          batchCorrect,
                          powerTransformPhenotype=TRUE,
                          removeLowVaryingGenes=0.2,
@@ -364,377 +361,340 @@ calcPhenotype<-function (trainingExprData,
   #Predict for each drug.
   #_______________________________________________________________
   # for(a in 1:length(drugs)){ #For each drug...
-
   # Zheng 20251230 ncores
   if(missing(ncore)){
     ncore <- parallel::detectCores() - 1
   }
-  cl <- parallel::makeCluster(ncore)
-  doParallel::registerDoParallel(cl)
-  # Zheng 20251230: It is a "safeguard mechanism" that ensures the parallel cluster is shut down safely.
-  # Zheng 20251230: 这是一个确保并行集群被安全关闭的“保险机制”。
-  on.exit(parallel::stopCluster(cl), add = TRUE)
 
-  result_list <- foreach::foreach( a = seq_along(drugs),
-           .packages = c(
-             "sva","ridge", "car", "glmnet", "tidyverse","pls", "stats", "utils"
-           ),
-           .errorhandling = "pass",
-           .verbose = FALSE
-           ) %dopar% {
-
-    #Modify trainingPtype and trainingExprData so that you only use cell lines for which you have expression and response data for.
-    #_______________________________________________________________
-    trainingPtype2<-trainingPtype[,a] #Obtain the response data for the compound of interest.
-    NonNAindex <- which(!is.na(trainingPtype2)) #Get the indices of the non NAs. You only want the cell lines/cosmic ids that you have drug info for.
-
-    samps<-rownames(trainingPtype)[NonNAindex] #Obtain cell lines you have expression and response data for.
-    # Zheng 20251230: logs
-    log <- c()
-
-    if (length(samps) == 1){ #Make sure training data has more than just 1 sample. If the drug has one sample, it will be skipped.
-      drugs = drugs[-a]
-      # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-      log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-      next
-    } else {
-
-      trainingPtype4<-as.numeric(trainingPtype2[NonNAindex]) #This makes sure you use all the response data for the drug without NA values.
-
-      #PowerTransform the phenotype if specified.
+  result_list <- mclapply(
+    X = seq_along(drugs),
+    mc.cores = ncore,
+    FUN = function(a){
+      #Modify trainingPtype and trainingExprData so that you only use cell lines for which you have expression and response data for.
       #_______________________________________________________________
-      offset = 0
-      if (powerTransformPhenotype){
-        if (min(trainingPtype4) < 0){ #All numbers must be positive for a powertransform to work, so make them positive.
-          offset <- -min(trainingPtype4) + 1
-          trainingPtype4 <- trainingPtype4 + offset
-        }
-        transForm <- powerTransform(trainingPtype4)[[6]]
-        trainingPtype4 <- trainingPtype4^transForm
-      }
+      trainingPtype2<-trainingPtype[,a] #Obtain the response data for the compound of interest.
+      NonNAindex <- which(!is.na(trainingPtype2)) #Get the indices of the non NAs. You only want the cell lines/cosmic ids that you have drug info for.
 
-      #Create the ridge regression model on the training data using pcr (keeping the number of components required for 80% variance).
-      #_______________________________________________________________
-      if (pcr){
+      samps<-rownames(trainingPtype)[NonNAindex] #Obtain cell lines you have expression and response data for.
 
-        #There are many ways for pcr in R...here I will use pcr() (principal component regression).
-
-        #Use pcr to predict for testing data.
-        #_______________________________________________________________
-        train_x<-(t(homData$train)[samps,keepRows]) #samps represent the cell lines that have been filtered, keepRows represents the genes.
-        train_y<-trainingPtype4
-
-        test_x<-(t(homData$test)[,keepRows])
-
-        #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
-        #If you don't, it causes problems in linearRidge().
-        #This is weird, but there were 2 genes in CTRPv2 data that had 0's for one drug (I suppose this occurs depending on sample filtration).
-        #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
-        x<-as.vector(colSums(train_x)) #Sum each column.
-        bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
-        if(length(bad) != 0){
-          train_x<-train_x[,-bad]
-          test_x<-data.frame(test_x[,-bad])
-        }
-        #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
-        variance<-c()
-        for(i in 1:ncol(train_x)){
-          variance[i]<-var(as.vector(train_x[,i]))
-        }
-        bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
-        if(length(bi) != 0){
-          train_x<-train_x[,-bi]
-          test_x<-data.frame(test_x[,-bi])
-        }
-
-        #Check to make sure you have more than 1 training sample for the drug's model.
-        #_______________________________________________________________
-        trainFrame<-try(data.frame(Resp=train_y, train_x), silent = TRUE)
-        if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
-          drugs = drugs[-a]
-          # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          next
-        } else {
-
-          pcr_model<-pcr(Resp~., data=trainFrame, validation='CV')
-
-          v=cumsum(explvar(pcr_model)) #A vector of all the pcs and their percent of variance.
-          ncomp=min(which(v > percent)) #Identify which pcs will represent 80% variance.
-
-          #vs[a]<-ncomp
-
-          # if(printOutput) message("\nCalculating predicted phenotype using pcr...")
-          if(printOutput) log <- append(log, "\nCalculating predicted phenotype using pcr...")
-          preds<-predict(pcr_model, newdata=test_x, ncomp=ncomp)
-
-          #You can compute an R^2 value for the data you train on from true and predicted values.
-          #The rsq value represents the percentage in which the optimal model accounts for the variance in the training data.
-          #_______________________________________________________________
-          if (rsq){
-
-            if (dim(train_x)[1] < 4){ #The code will result in an error if you have 3 samples (which is enough for the model fitting but not when you do a 70/30% split)...
-              # message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-              log <- append(log, paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-            }else{
-
-              #trainFrame<-data.frame(Resp=train_y, train_x)
-
-              data<-(cbind(train_x, train_y)) #Rows are samples, columns are genes.
-
-              dt<-sort(sample(nrow(data), nrow(data)*.7)) #sample() randomly picks 70% of rows/samples from the dataset. It samples without replacement.
-
-              #Prepare the training data (70% of original training data)
-              train_x<-data[dt,]
-              ncol<-dim(train_x)[2]
-              train_y<-train_x[,ncol]
-              train_x<-train_x[,-ncol]
-
-              #Prepare the testing data (30% of original training data)
-              test_x<-data[-dt,]
-              ncol<-dim(test_x)[2]
-              test_y<-test_x[,ncol]
-              test_x<-test_x[,-ncol]
-
-              #Remove genes that you have no transcriptome data for aka columns are filled with 0's.
-              #If you don't, it causes problems in linearRidge()
-              #Make sure you remove these same genes from the test data...want to make sure the genes are the same in both.
-              x<-as.vector(colSums(train_x))
-              bad<-which(x == 0)
-              if (length(bad) != 0){
-                train_x<-train_x[,-bad]
-                test_x<-data.frame(test_x[,-bad])
-              }
-              #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge()
-              variance<-c()
-              for(i in 1:ncol(train_x)){
-                variance[i]<-var(as.vector(train_x[,i]))
-              }
-              bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
-              if (length(bi) != 0){
-                train_x<-train_x[,-bi]
-              }
-
-              data<-data.frame(Resp=train_y, train_x)
-
-              pcr_model<-pcr(Resp~., data=data, validation='CV') #Set validation argument to CV.
-
-              v=cumsum(explvar(pcr_model)) #A vector of all the pcs and their percent of variance.
-              ncomp=min(which(v > percent)) #Identify which pcs will represent 80% variance.
-
-              pcr_pred<-predict(pcr_model, test_x, ncomp=ncomp)
-
-              if (printOutput) message("\nCalculating R^2...")
-              sst<-sum((test_y - mean(test_y))^2) #Compute the sum of squares total.
-              sse<-sum((pcr_pred - test_y)^2) #Compute the sum of squares error.
-              rsq_value<-1 - sse/sst #Compute the rsq value.
-            }
-          }
-        }
-
-        if (report_pc){
-          # if (printOutput) message("\nObtaining principal components...")
-          if (printOutput) log <- append(log, "\nObtaining principal components...")
-          pcs<-coef(pcr_model, comps = ncomp) #comps: numeric, which components to return.
-          dir.create(dir_folder)
-          path<-paste(dir_folder,"/", drugs[a], '.RData', sep="")
-          save(pcs, file=path)
-        }
-
+      if (length(samps) == 1){ #Make sure training data has more than just 1 sample. If the drug has one sample, it will be skipped.
+        drugs = drugs[-a]
+        message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+        next
       } else {
 
-        #Create the ridge regression model on our training data to predict for our actual testing data without pcr.
+        trainingPtype4<-as.numeric(trainingPtype2[NonNAindex]) #This makes sure you use all the response data for the drug without NA values.
+
+        #PowerTransform the phenotype if specified.
         #_______________________________________________________________
-        # if(printOutput) message("\nFitting Ridge Regression model...");
-        if (printOutput) log <- append(log, "\nFitting Ridge Regression model...")
-
-        expression<-(t(homData$train)[samps,keepRows]) #samps represent the cell lines that have been filtered, keepRows represents the genes.
-
-        test_x<-(t(homData$test)[,keepRows])
-
-        #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
-        #If you don't, it causes problems in linearRidge().
-        #This is weird, but there were 2 genes in CTRPv2 data that had 0's for one drug (I suppose this occurs depending on sample filtration).
-        #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
-        x<-as.vector(colSums(expression))
-        bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
-        if (length(bad) != 0){
-          expression<-expression[,-bad]
-          test_x<-data.frame(test_x[,-bad])
+        offset = 0
+        if (powerTransformPhenotype){
+          if (min(trainingPtype4) < 0){ #All numbers must be positive for a powertransform to work, so make them positive.
+            offset <- -min(trainingPtype4) + 1
+            trainingPtype4 <- trainingPtype4 + offset
+          }
+          transForm <- powerTransform(trainingPtype4)[[6]]
+          trainingPtype4 <- trainingPtype4^transForm
         }
 
-        #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
-        variance<-c()
-        for (i in 1:ncol(expression)){
-          variance[i]<-var(as.vector(expression[,i]))
-        }
-        bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
-        if (length(bi) != 0){ #If there are actually bad indices/genes that had 0 variance across all samples, remove them.
-          expression<-expression[,-bi]
-          test_x<-data.frame(test_x[,-bi])
-        }
-
-        #Check to make sure you have more than 1 training sample for the drug's model.
+        #Create the ridge regression model on the training data using pcr (keeping the number of components required for 80% variance).
         #_______________________________________________________________
-        trainFrame<-try(data.frame(Resp=trainingPtype4, expression), silent = TRUE)
-        if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
-          drugs = drugs[-a]
-          # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          next
+        if (pcr){
+
+          #There are many ways for pcr in R...here I will use pcr() (principal component regression).
+
+          #Use pcr to predict for testing data.
+          #_______________________________________________________________
+          train_x<-(t(homData$train)[samps,keepRows]) #samps represent the cell lines that have been filtered, keepRows represents the genes.
+          train_y<-trainingPtype4
+
+          test_x<-(t(homData$test)[,keepRows])
+
+          #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
+          #If you don't, it causes problems in linearRidge().
+          #This is weird, but there were 2 genes in CTRPv2 data that had 0's for one drug (I suppose this occurs depending on sample filtration).
+          #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
+          x<-as.vector(colSums(train_x)) #Sum each column.
+          bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
+          if(length(bad) != 0){
+            train_x<-train_x[,-bad]
+            test_x<-data.frame(test_x[,-bad])
+          }
+          #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
+          variance<-c()
+          for(i in 1:ncol(train_x)){
+            variance[i]<-var(as.vector(train_x[,i]))
+          }
+          bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
+          if(length(bi) != 0){
+            train_x<-train_x[,-bi]
+            test_x<-data.frame(test_x[,-bi])
+          }
+
+          #Check to make sure you have more than 1 training sample for the drug's model.
+          #_______________________________________________________________
+          trainFrame<-try(data.frame(Resp=train_y, train_x), silent = TRUE)
+          if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
+            drugs = drugs[-a]
+            message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+            next
+          } else {
+
+            pcr_model<-pcr(Resp~., data=trainFrame, validation='CV')
+
+            v=cumsum(explvar(pcr_model)) #A vector of all the pcs and their percent of variance.
+            ncomp=min(which(v > percent)) #Identify which pcs will represent 80% variance.
+
+            #vs[a]<-ncomp
+
+            if(printOutput) message("\nCalculating predicted phenotype using pcr...")
+            preds<-predict(pcr_model, newdata=test_x, ncomp=ncomp)
+
+            #You can compute an R^2 value for the data you train on from true and predicted values.
+            #The rsq value represents the percentage in which the optimal model accounts for the variance in the training data.
+            #_______________________________________________________________
+            if (rsq){
+
+              if (dim(train_x)[1] < 4){ #The code will result in an error if you have 3 samples (which is enough for the model fitting but not when you do a 70/30% split)...
+                message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
+              }else{
+
+                #trainFrame<-data.frame(Resp=train_y, train_x)
+
+                data<-(cbind(train_x, train_y)) #Rows are samples, columns are genes.
+
+                dt<-sort(sample(nrow(data), nrow(data)*.7)) #sample() randomly picks 70% of rows/samples from the dataset. It samples without replacement.
+
+                #Prepare the training data (70% of original training data)
+                train_x<-data[dt,]
+                ncol<-dim(train_x)[2]
+                train_y<-train_x[,ncol]
+                train_x<-train_x[,-ncol]
+
+                #Prepare the testing data (30% of original training data)
+                test_x<-data[-dt,]
+                ncol<-dim(test_x)[2]
+                test_y<-test_x[,ncol]
+                test_x<-test_x[,-ncol]
+
+                #Remove genes that you have no transcriptome data for aka columns are filled with 0's.
+                #If you don't, it causes problems in linearRidge()
+                #Make sure you remove these same genes from the test data...want to make sure the genes are the same in both.
+                x<-as.vector(colSums(train_x))
+                bad<-which(x == 0)
+                if (length(bad) != 0){
+                  train_x<-train_x[,-bad]
+                  test_x<-data.frame(test_x[,-bad])
+                }
+                #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge()
+                variance<-c()
+                for(i in 1:ncol(train_x)){
+                  variance[i]<-var(as.vector(train_x[,i]))
+                }
+                bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
+                if (length(bi) != 0){
+                  train_x<-train_x[,-bi]
+                }
+
+                data<-data.frame(Resp=train_y, train_x)
+
+                pcr_model<-pcr(Resp~., data=data, validation='CV') #Set validation argument to CV.
+
+                v=cumsum(explvar(pcr_model)) #A vector of all the pcs and their percent of variance.
+                ncomp=min(which(v > percent)) #Identify which pcs will represent 80% variance.
+
+                pcr_pred<-predict(pcr_model, test_x, ncomp=ncomp)
+
+                if (printOutput) message("\nCalculating R^2...")
+                sst<-sum((test_y - mean(test_y))^2) #Compute the sum of squares total.
+                sse<-sum((pcr_pred - test_y)^2) #Compute the sum of squares error.
+                rsq_value<-1 - sse/sst #Compute the rsq value.
+              }
+            }
+          }
+
+          if (report_pc){
+            if (printOutput) message("\nObtaining principal components...")
+            pcs<-coef(pcr_model, comps = ncomp) #comps: numeric, which components to return.
+            dir.create(dir_folder)
+            path<-paste(dir_folder,"/", drugs[a], '.RData', sep="")
+            save(pcs, file=path)
+          }
+
         } else {
 
-          # if(printOutput) message("\nCalculating predicted phenotype...")
-          if(printOutput) log <- append(log, "\nCalculating predicted phenotype...")
-
-          rrModel<-linearRidge(Resp ~., data=trainFrame)
-
-          preds<-predict(rrModel, newdata=data.frame(test_x))
-
-          #You can compute an R^2 value for the data you train on from true and predicted values.
-          #The R^2 value represents the percentage in which the optimal model accounts for the variance in the training data.
+          #Create the ridge regression model on our training data to predict for our actual testing data without pcr.
           #_______________________________________________________________
-          if(rsq){
+          if(printOutput) message("\nFitting Ridge Regression model...");
 
-            if (dim(expression)[1] < 4){ #The code will result in an error if you have 3 samples...this makes sure you have more than 3 samples.
-              #It results in an error because there is a 70/30% split of training data.
-              # message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-              log <- append(log, paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-            } else {
-              expression<-(cbind(expression, trainingPtype4))
-              dt<-sort(sample(nrow(expression), nrow(expression)*.7)) #sample() randomly picks 70% of rows/samples from the dataset. It samples without replacement.
+          expression<-(t(homData$train)[samps,keepRows]) #samps represent the cell lines that have been filtered, keepRows represents the genes.
 
-              #Prepare the training data (70% of original training data)
-              train_x<-expression[dt,]
-              ncol<-dim(train_x)[2]
-              train_y<-train_x[,ncol]
-              train_x<-train_x[,-ncol]
+          test_x<-(t(homData$test)[,keepRows])
 
-              #Prepare the testing data (30% of original training data)
-              test_x<-expression[-dt,]
-              ncol<-dim(test_x)[2]
-              test_y<-test_x[,ncol]
-              test_x<-test_x[,-ncol]
+          #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
+          #If you don't, it causes problems in linearRidge().
+          #This is weird, but there were 2 genes in CTRPv2 data that had 0's for one drug (I suppose this occurs depending on sample filtration).
+          #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
+          x<-as.vector(colSums(expression))
+          bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
+          if (length(bad) != 0){
+            expression<-expression[,-bad]
+            test_x<-data.frame(test_x[,-bad])
+          }
 
-              #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
-              #If you don't, it causes problems in linearRidge().
-              #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
-              x<-as.vector(colSums(train_x))
-              bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
-              if (length(bad) != 0){
-                train_x<-train_x[,-bad]
-                test_x<-data.frame(test_x[,-bad])
+          #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
+          variance<-c()
+          for (i in 1:ncol(expression)){
+            variance[i]<-var(as.vector(expression[,i]))
+          }
+          bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
+          if (length(bi) != 0){ #If there are actually bad indices/genes that had 0 variance across all samples, remove them.
+            expression<-expression[,-bi]
+            test_x<-data.frame(test_x[,-bi])
+          }
+
+          #Check to make sure you have more than 1 training sample for the drug's model.
+          #_______________________________________________________________
+          trainFrame<-try(data.frame(Resp=trainingPtype4, expression), silent = TRUE)
+          if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
+            drugs = drugs[-a]
+            message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+            next
+          } else {
+
+            if(printOutput) message("\nCalculating predicted phenotype...")
+
+            rrModel<-linearRidge(Resp ~., data=trainFrame)
+
+            preds<-predict(rrModel, newdata=data.frame(test_x))
+
+            #You can compute an R^2 value for the data you train on from true and predicted values.
+            #The R^2 value represents the percentage in which the optimal model accounts for the variance in the training data.
+            #_______________________________________________________________
+            if(rsq){
+
+              if (dim(expression)[1] < 4){ #The code will result in an error if you have 3 samples...this makes sure you have more than 3 samples.
+                #It results in an error because there is a 70/30% split of training data.
+                message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
+              } else {
+                expression<-(cbind(expression, trainingPtype4))
+                dt<-sort(sample(nrow(expression), nrow(expression)*.7)) #sample() randomly picks 70% of rows/samples from the dataset. It samples without replacement.
+
+                #Prepare the training data (70% of original training data)
+                train_x<-expression[dt,]
+                ncol<-dim(train_x)[2]
+                train_y<-train_x[,ncol]
+                train_x<-train_x[,-ncol]
+
+                #Prepare the testing data (30% of original training data)
+                test_x<-expression[-dt,]
+                ncol<-dim(test_x)[2]
+                test_y<-test_x[,ncol]
+                test_x<-test_x[,-ncol]
+
+                #Remove genes that you have no transcriptome data for (aka columns are filled with 0's).
+                #If you don't, it causes problems in linearRidge().
+                #Make sure you remove those same genes from the test data...want to make sure the genes are the same in both train_x and test_x
+                x<-as.vector(colSums(train_x))
+                bad<-which(x == 0) #Column/genes indices that are filled with only 0's.
+                if (length(bad) != 0){
+                  train_x<-train_x[,-bad]
+                  test_x<-data.frame(test_x[,-bad])
+                }
+
+                #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
+                variance<-c()
+                for (i in 1:ncol(train_x)){
+                  variance[i]<-var(as.vector(train_x[,i]))
+                }
+                bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
+                if (length(bi) != 0){ #If there are actually bad indices/genes that had 0 variance across all samples, remove them.
+                  train_x<-train_x[,-bi]
+                  test_x<-data.frame(test_x[,-bi])
+                }
+
+                trainFrame<-data.frame(Resp=train_y, train_x)
+                rrModel<-linearRidge(Resp ~., data=trainFrame)
+
+                testFrame<-data.frame(test_x)
+
+                pred<-predict(rrModel, newdata=testFrame)
+
+                if(printOutput) message("\nCalculating R^2...")
+
+                sst<-sum((test_y - mean(test_y))^2) #Compute the sum of squares total.
+                sse<-sum((pred - test_y)^2) #Compute the sum of squares error.
+                rsq_value<-1 - sse/sst #Compute the rsq value.
+
               }
-
-              #Remove genes with 0 variance. If you don't, this will also cause problems in linearRidge().
-              variance<-c()
-              for (i in 1:ncol(train_x)){
-                variance[i]<-var(as.vector(train_x[,i]))
-              }
-              bi<-which(variance %in% 0) #Bad index...gene has 0 variance.
-              if (length(bi) != 0){ #If there are actually bad indices/genes that had 0 variance across all samples, remove them.
-                train_x<-train_x[,-bi]
-                test_x<-data.frame(test_x[,-bi])
-              }
-
-              trainFrame<-data.frame(Resp=train_y, train_x)
-              rrModel<-linearRidge(Resp ~., data=trainFrame)
-
-              testFrame<-data.frame(test_x)
-
-              pred<-predict(rrModel, newdata=testFrame)
-
-              if(printOutput) message("\nCalculating R^2...")
-
-              sst<-sum((test_y - mean(test_y))^2) #Compute the sum of squares total.
-              sse<-sum((pred - test_y)^2) #Compute the sum of squares error.
-              rsq_value<-1 - sse/sst #Compute the rsq value.
-
             }
           }
         }
-      }
 
-      #If the response variable was transformed (aka powerTransformPhenotype=TRUE), untransform it here.
-      #_______________________________________________________________
-      if(powerTransformPhenotype) {
-        preds <- preds^(1/transForm)
-        preds <- preds - offset
-      }
-
-      #Find correlation between imputed response and expression of a gene.
-      #Each gene is corrected differently; therefore, it may not be ideal to determine weight or percentage or weight in which each gene contributes to the prediction.
-      #_______________________________________________________________
-      if(cc){ #You can only collect correlations if pcr=FALSE!
-        if(pcr){
-          stop('ERROR: pcr must equal FALSE in order to compute correlations') #It doesn't make sense to compute correlations when the features have changed from genes to pcs.
+        #If the response variable was transformed (aka powerTransformPhenotype=TRUE), untransform it here.
+        #_______________________________________________________________
+        if(powerTransformPhenotype) {
+          preds <- preds^(1/transForm)
+          preds <- preds - offset
         }
 
-        # if(printOutput) message("\nCalculating correlation coefficients...") #This is only relevant if you aren't using pcr.
-        if(printOutput) log <- append(log, "\nCalculating correlation coefficients...")
-        cors_vec<-c() #This vector will store the correlation coefficients.
-        cors_vec2<-c() #This vector will store the p values.
-        matrix<-homData$test[keepRows,] #Matrix of genes x cell lines/cosmic ids.
-        for(d in 1:nrow(matrix)){ #For each gene...
-          cors_vec[d]<-cor.test(as.vector(matrix[d,]), as.vector(preds))$estimate #Compute correlation coefficient for expression of a given gene across patients vs.imputed values for a given drug across patients.
-          cors_vec2[d]<-cor.test(as.vector(matrix[d,]), as.vector(preds))$p.value
+        #Find correlation between imputed response and expression of a gene.
+        #Each gene is corrected differently; therefore, it may not be ideal to determine weight or percentage or weight in which each gene contributes to the prediction.
+        #_______________________________________________________________
+        if(cc){ #You can only collect correlations if pcr=FALSE!
+          if(pcr){
+            stop('ERROR: pcr must equal FALSE in order to compute correlations') #It doesn't make sense to compute correlations when the features have changed from genes to pcs.
+          }
+
+          if(printOutput) message("\nCalculating correlation coefficients...") #This is only relevant if you aren't using pcr.
+
+          cors_vec<-c() #This vector will store the correlation coefficients.
+          cors_vec2<-c() #This vector will store the p values.
+          matrix<-homData$test[keepRows,] #Matrix of genes x cell lines/cosmic ids.
+          for(d in 1:nrow(matrix)){ #For each gene...
+            cors_vec[d]<-cor.test(as.vector(matrix[d,]), as.vector(preds))$estimate #Compute correlation coefficient for expression of a given gene across patients vs.imputed values for a given drug across patients.
+            cors_vec2[d]<-cor.test(as.vector(matrix[d,]), as.vector(preds))$p.value
+          }
+          #indices<-order(cor, decreasing=TRUE)
+          #ordered_cor<-cor[indices] #Order the correlation coefficients from big to small.
+          #genes<-rownames(matrix)
+          #ordered_genes<-genes[indices]
+          #names(ordered_cor)<-ordered_genes
         }
-        #indices<-order(cor, decreasing=TRUE)
-        #ordered_cor<-cor[indices] #Order the correlation coefficients from big to small.
-        #genes<-rownames(matrix)
-        #ordered_genes<-genes[indices]
-        #names(ordered_cor)<-ordered_genes
+
+        if(printOutput) message(paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)))
+
+        #Store the data in your lists.
+        #_______________________________________________________________
+        DrugPredictions[[a]]<-preds
+
+        if(rsq){
+          rsqs[[a]]<-rsq_value
+        }
+
+        if(cc){
+          cors[[a]]<-cors_vec
+          pvalues[[a]]<-cors_vec2
+        }
       }
-
-      # if(printOutput) message(paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)))
-      if(printOutput) log <- append(log, paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)) )
-
-      #Store the data in your lists.
-      #_______________________________________________________________
-      DrugPredictions[[a]]<-preds
-
-      if(rsq){
-        rsqs[[a]]<-rsq_value
-      }
-
-      if(cc){
-        cors[[a]]<-cors_vec
-        pvalues[[a]]<-cors_vec2
-      }
+      return(DrugPredictions[[a]]) # Zheng: 20251230 # return(preds) 可以直接这么写，但是现在的写法对原函数改动最少
     }
-    # return(DrugPredictions[[a]]) # Zheng: 20251230 # return(preds) 可以直接这么写，但是现在的写法对原函数改动最少
-    return(list(DrugPredictions[[a]],log))
-  } # END: Predict for each drug. Zheng: 20251230
+  )
 
-  # result_list[[1]] # 每个药物结果第1个元素为IC50结果，第2个结果为log日志
-  # [[1]]
-  # TCGA.XJ.A83F.01 TCGA.G9.6348.01 TCGA.CH.5766.01 TCGA.EJ.A65G.01 TCGA.G9.6354.01 TCGA.EJ.5527.01 TCGA.HC.8213.01
-  # 0.21999081      0.22341986      0.16077117      0.22044990      0.22372098      0.08059654      0.30231798
-  # TCGA.Y6.A9XI.01 TCGA.EJ.7125.11 TCGA.CH.5744.01 TCGA.EJ.7782.11 TCGA.HC.A9TE.01 TCGA.EJ.A7NJ.01 TCGA.SU.A7E7.01
-  # 0.20310255      0.20835879      0.12045925      0.08204977      0.04060583      0.08180523      0.07394332
-  # TCGA.CH.5772.01 TCGA.HI.7168.01 TCGA.ZG.A9L0.01 TCGA.HC.7075.01 TCGA.V1.A9Z8.01 TCGA.KK.A7AW.01
-  # 0.09453957      0.15124785      0.10476259      0.03630665      0.07634080      0.05970948
-  #
-  # [[2]]
-  # [1] "\nFitting Ridge Regression model..."        "\nCalculating predicted phenotype..."
-  # [3] "\nDone making prediction for drug 1 of 198"
+
+# } # END: Predict for each drug. Zheng: 20251230 # 原for循环的END
 
   #Time to save the data!
   #_______________________________________________________________
   #Save drug prediction data to your home directory as a .txt file.
-  # DrugPredictions is a list: Zheng 20251230
-  DrugPredictions <- lapply(result_list, `[[`, 1)  # Zheng 20251230 result of foreach + doParallel
-  all_logs <- lapply(result_list, `[[`, 2) # Zheng 20251230 logs of foreach + doParallel
-  cat(unlist(all_logs),"\n") #  Zheng 20251230 print logs of foreach + doParallel
+
+  DrugPredictions <- result_list # Zheng: 20251230
   names(DrugPredictions)<-drugs
   DrugPredictions_mat<-do.call(cbind, DrugPredictions)
-  # DrugPredictions_mat[1:4,1:4] Zheng 20251230
-  # colnames are drugs Zheng 20251230
-  # rownames are sampleIDs Zheng 20251230
   colnames(DrugPredictions_mat)<-drugs
   rownames(DrugPredictions_mat)<-colnames(testExprData)
 
-  if(folder){ # Zheng 20251230 don't export result file when 'folder=FALSE'.
+  if(folder){
   dir.create(dir_folder)
   write.csv(DrugPredictions_mat, file=paste0(dir_folder,"/DrugPredictions.csv"), row.names = TRUE, col.names = TRUE)
 
@@ -764,11 +724,8 @@ calcPhenotype<-function (trainingExprData,
     }
 
   } else {
-    if(report_log){
-      return(list(DrugPredictions_mat, all_logs))
-    }else{
-      return(DrugPredictions_mat)
-    }
+
+    return(DrugPredictions_mat)
 
   }
 

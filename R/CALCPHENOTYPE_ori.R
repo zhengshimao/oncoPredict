@@ -224,8 +224,6 @@ summarizeGenesByMean <- function(exprMat)
 #'@param trainingExprData The training data. A matrix of expression levels. rownames() are genes, colnames() are samples (cell line names or cosmic ides, etc.). rownames() must be specified and must contain the same type of gene ids as "testExprData"
 #'@param trainingPtype The known phenotype for "trainingExprData". This data must be a matrix of drugs/rows x cell lines/columns or cosmic ids/columns. This matrix can contain NA values, that is ok (they are removed in the calcPhenotype() function).
 #'@param testExprData The test data where the phenotype will be estimated. It is a matrix of expression levels, rows contain genes and columns contain samples, "rownames()" must be specified and must contain the same type of gene ids as "trainingExprData".
-#'@param ncore Number of threads. Default: all threads.
-#'@param report_log return logs infor or not. Default: FALSE.
 #'@param batchCorrect How should training and test data matrices be homogenized. Choices are "eb" (default) for ComBat, "qn" for quantiles normalization or "none" for no homogenization.
 #'@param powerTransformPhenotype Should the phenotype be power transformed before we fit the regression model? Default to TRUE, set to FALSE if the phenotype is already known to be highly normal.
 #'@param removeLowVaryingGenes What proportion of low varying genes should be removed? 20 percent be default
@@ -243,12 +241,9 @@ summarizeGenesByMean <- function(exprMat)
 #'These values represent the percentage in which the optimal model accounts for the variance in the training data.
 #'Options are 'TRUE' and 'FALSE'. folder must be set to TRUE
 #'@param folder Indicate whether the user wants to return a folder or simply assign the calcPhenotype output. If true, run the function without assignment as it will return a folder with the results. If false, assign <- calcphenotype to save results
-#'@param dir_folder Output directory. Default: './calcPhenotype_Output'.
 #'@return Depends on the folder parameter. If folder = True, .txt files will be saved into a folder in your working directory automatically. The folder will include the estimated drug response values as a .txt file. Depending on the rsq, cc, report_pc parameters specified, the .txt file outputs of this function will also include
 #'the R^2 data, and the correlation coefficients and principal components are stored as .RData files for each drug in your drug dataset.
 #'If folder = 'FALSE', then only the predicted drug response values will be returned as an object.
-#'@import foreach
-#'@import doParallel
 #'@import sva
 #'@import ridge
 #'@import car
@@ -260,11 +255,9 @@ summarizeGenesByMean <- function(exprMat)
 #'@importFrom pls explvar explvar
 #'@keywords predict drug sensitivity and phenotype
 #'@export
-calcPhenotype<-function (trainingExprData,
+calcPhenotype_ori<-function (trainingExprData,
                          trainingPtype,
                          testExprData,
-                         ncore,
-                         report_log=FALSE,
                          batchCorrect,
                          powerTransformPhenotype=TRUE,
                          removeLowVaryingGenes=0.2,
@@ -277,9 +270,7 @@ calcPhenotype<-function (trainingExprData,
                          cc=FALSE,
                          percent=80,
                          rsq=FALSE,
-                         folder = TRUE,
-                         dir_folder = "./calcPhenotype_Output"
-                         )
+                         folder = TRUE)
 {
 
   #Initiate empty lists for each data type you'd like to collect.
@@ -363,25 +354,7 @@ calcPhenotype<-function (trainingExprData,
 
   #Predict for each drug.
   #_______________________________________________________________
-  # for(a in 1:length(drugs)){ #For each drug...
-
-  # Zheng 20251230 ncores
-  if(missing(ncore)){
-    ncore <- parallel::detectCores() - 1
-  }
-  cl <- parallel::makeCluster(ncore)
-  doParallel::registerDoParallel(cl)
-  # Zheng 20251230: It is a "safeguard mechanism" that ensures the parallel cluster is shut down safely.
-  # Zheng 20251230: 这是一个确保并行集群被安全关闭的“保险机制”。
-  on.exit(parallel::stopCluster(cl), add = TRUE)
-
-  result_list <- foreach::foreach( a = seq_along(drugs),
-           .packages = c(
-             "sva","ridge", "car", "glmnet", "tidyverse","pls", "stats", "utils"
-           ),
-           .errorhandling = "pass",
-           .verbose = FALSE
-           ) %dopar% {
+  for(a in 1:length(drugs)){ #For each drug...
 
     #Modify trainingPtype and trainingExprData so that you only use cell lines for which you have expression and response data for.
     #_______________________________________________________________
@@ -389,13 +362,10 @@ calcPhenotype<-function (trainingExprData,
     NonNAindex <- which(!is.na(trainingPtype2)) #Get the indices of the non NAs. You only want the cell lines/cosmic ids that you have drug info for.
 
     samps<-rownames(trainingPtype)[NonNAindex] #Obtain cell lines you have expression and response data for.
-    # Zheng 20251230: logs
-    log <- c()
 
     if (length(samps) == 1){ #Make sure training data has more than just 1 sample. If the drug has one sample, it will be skipped.
       drugs = drugs[-a]
-      # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-      log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+      message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
       next
     } else {
 
@@ -452,8 +422,7 @@ calcPhenotype<-function (trainingExprData,
         trainFrame<-try(data.frame(Resp=train_y, train_x), silent = TRUE)
         if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
           drugs = drugs[-a]
-          # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+          message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
           next
         } else {
 
@@ -464,8 +433,7 @@ calcPhenotype<-function (trainingExprData,
 
           #vs[a]<-ncomp
 
-          # if(printOutput) message("\nCalculating predicted phenotype using pcr...")
-          if(printOutput) log <- append(log, "\nCalculating predicted phenotype using pcr...")
+          if(printOutput) message("\nCalculating predicted phenotype using pcr...")
           preds<-predict(pcr_model, newdata=test_x, ncomp=ncomp)
 
           #You can compute an R^2 value for the data you train on from true and predicted values.
@@ -474,8 +442,7 @@ calcPhenotype<-function (trainingExprData,
           if (rsq){
 
             if (dim(train_x)[1] < 4){ #The code will result in an error if you have 3 samples (which is enough for the model fitting but not when you do a 70/30% split)...
-              # message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-              log <- append(log, paste("\n", drugs[a], 'is skipped for R^2 analysis'))
+              message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
             }else{
 
               #trainFrame<-data.frame(Resp=train_y, train_x)
@@ -533,11 +500,10 @@ calcPhenotype<-function (trainingExprData,
         }
 
         if (report_pc){
-          # if (printOutput) message("\nObtaining principal components...")
-          if (printOutput) log <- append(log, "\nObtaining principal components...")
+          if (printOutput) message("\nObtaining principal components...")
           pcs<-coef(pcr_model, comps = ncomp) #comps: numeric, which components to return.
-          dir.create(dir_folder)
-          path<-paste(dir_folder,"/", drugs[a], '.RData', sep="")
+          dir.create("./calcPhenotype_Output")
+          path<-paste('./calcPhenotype_Output/', drugs[a], '.RData', sep="")
           save(pcs, file=path)
         }
 
@@ -545,8 +511,7 @@ calcPhenotype<-function (trainingExprData,
 
         #Create the ridge regression model on our training data to predict for our actual testing data without pcr.
         #_______________________________________________________________
-        # if(printOutput) message("\nFitting Ridge Regression model...");
-        if (printOutput) log <- append(log, "\nFitting Ridge Regression model...")
+        if(printOutput) message("\nFitting Ridge Regression model...");
 
         expression<-(t(homData$train)[samps,keepRows]) #samps represent the cell lines that have been filtered, keepRows represents the genes.
 
@@ -579,13 +544,11 @@ calcPhenotype<-function (trainingExprData,
         trainFrame<-try(data.frame(Resp=trainingPtype4, expression), silent = TRUE)
         if (dim(trainFrame)[1] == 1){ #Make sure you have more than 1 sample.
           drugs = drugs[-a]
-          # message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
-          log <- append(log, paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
+          message(paste("\n", drugs[a], "is skipped due to insufficient cell lines to fit the model."))
           next
         } else {
 
-          # if(printOutput) message("\nCalculating predicted phenotype...")
-          if(printOutput) log <- append(log, "\nCalculating predicted phenotype...")
+          if(printOutput) message("\nCalculating predicted phenotype...")
 
           rrModel<-linearRidge(Resp ~., data=trainFrame)
 
@@ -598,8 +561,7 @@ calcPhenotype<-function (trainingExprData,
 
             if (dim(expression)[1] < 4){ #The code will result in an error if you have 3 samples...this makes sure you have more than 3 samples.
               #It results in an error because there is a 70/30% split of training data.
-              # message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
-              log <- append(log, paste("\n", drugs[a], 'is skipped for R^2 analysis'))
+              message(paste("\n", drugs[a], 'is skipped for R^2 analysis'))
             } else {
               expression<-(cbind(expression, trainingPtype4))
               dt<-sort(sample(nrow(expression), nrow(expression)*.7)) #sample() randomly picks 70% of rows/samples from the dataset. It samples without replacement.
@@ -670,8 +632,8 @@ calcPhenotype<-function (trainingExprData,
           stop('ERROR: pcr must equal FALSE in order to compute correlations') #It doesn't make sense to compute correlations when the features have changed from genes to pcs.
         }
 
-        # if(printOutput) message("\nCalculating correlation coefficients...") #This is only relevant if you aren't using pcr.
-        if(printOutput) log <- append(log, "\nCalculating correlation coefficients...")
+        if(printOutput) message("\nCalculating correlation coefficients...") #This is only relevant if you aren't using pcr.
+
         cors_vec<-c() #This vector will store the correlation coefficients.
         cors_vec2<-c() #This vector will store the p values.
         matrix<-homData$test[keepRows,] #Matrix of genes x cell lines/cosmic ids.
@@ -686,8 +648,7 @@ calcPhenotype<-function (trainingExprData,
         #names(ordered_cor)<-ordered_genes
       }
 
-      # if(printOutput) message(paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)))
-      if(printOutput) log <- append(log, paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)) )
+      if(printOutput) message(paste("\nDone making prediction for drug", a, "of", ncol(trainingPtype)))
 
       #Store the data in your lists.
       #_______________________________________________________________
@@ -702,48 +663,26 @@ calcPhenotype<-function (trainingExprData,
         pvalues[[a]]<-cors_vec2
       }
     }
-    # return(DrugPredictions[[a]]) # Zheng: 20251230 # return(preds) 可以直接这么写，但是现在的写法对原函数改动最少
-    return(list(DrugPredictions[[a]],log))
-  } # END: Predict for each drug. Zheng: 20251230
-
-  # result_list[[1]] # 每个药物结果第1个元素为IC50结果，第2个结果为log日志
-  # [[1]]
-  # TCGA.XJ.A83F.01 TCGA.G9.6348.01 TCGA.CH.5766.01 TCGA.EJ.A65G.01 TCGA.G9.6354.01 TCGA.EJ.5527.01 TCGA.HC.8213.01
-  # 0.21999081      0.22341986      0.16077117      0.22044990      0.22372098      0.08059654      0.30231798
-  # TCGA.Y6.A9XI.01 TCGA.EJ.7125.11 TCGA.CH.5744.01 TCGA.EJ.7782.11 TCGA.HC.A9TE.01 TCGA.EJ.A7NJ.01 TCGA.SU.A7E7.01
-  # 0.20310255      0.20835879      0.12045925      0.08204977      0.04060583      0.08180523      0.07394332
-  # TCGA.CH.5772.01 TCGA.HI.7168.01 TCGA.ZG.A9L0.01 TCGA.HC.7075.01 TCGA.V1.A9Z8.01 TCGA.KK.A7AW.01
-  # 0.09453957      0.15124785      0.10476259      0.03630665      0.07634080      0.05970948
-  #
-  # [[2]]
-  # [1] "\nFitting Ridge Regression model..."        "\nCalculating predicted phenotype..."
-  # [3] "\nDone making prediction for drug 1 of 198"
+  }
 
   #Time to save the data!
   #_______________________________________________________________
   #Save drug prediction data to your home directory as a .txt file.
-  # DrugPredictions is a list: Zheng 20251230
-  DrugPredictions <- lapply(result_list, `[[`, 1)  # Zheng 20251230 result of foreach + doParallel
-  all_logs <- lapply(result_list, `[[`, 2) # Zheng 20251230 logs of foreach + doParallel
-  cat(unlist(all_logs),"\n") #  Zheng 20251230 print logs of foreach + doParallel
   names(DrugPredictions)<-drugs
   DrugPredictions_mat<-do.call(cbind, DrugPredictions)
-  # DrugPredictions_mat[1:4,1:4] Zheng 20251230
-  # colnames are drugs Zheng 20251230
-  # rownames are sampleIDs Zheng 20251230
   colnames(DrugPredictions_mat)<-drugs
   rownames(DrugPredictions_mat)<-colnames(testExprData)
 
-  if(folder){ # Zheng 20251230 don't export result file when 'folder=FALSE'.
-  dir.create(dir_folder)
-  write.csv(DrugPredictions_mat, file=paste0(dir_folder,"/DrugPredictions.csv"), row.names = TRUE, col.names = TRUE)
+  if(folder){
+  dir.create("./calcPhenotype_Output")
+  write.csv(DrugPredictions_mat, file="./calcPhenotype_Output/DrugPredictions.csv", row.names = TRUE, col.names = TRUE)
 
   #If rsq=TRUE, save R^2 data.
     if(rsq){
       names(rsqs)<-drugs
       rsqs_mat<-do.call(cbind, rsqs)
-      dir.create(dir_folder)
-      write.table(rsqs_mat, file=paste0(dir_folder,"/R^2.txt"))
+      dir.create("./calcPhenotype_Output")
+      write.table(rsqs_mat, file="./calcPhenotype_Output/R^2.txt")
     }
 
   #If CC=TRUE, save correlation coefficient data.
@@ -752,23 +691,20 @@ calcPhenotype<-function (trainingExprData,
       cor_mat<-do.call(cbind, cors)
       rownames(cor_mat)<-rownames(homData$train[keepRows,NonNAindex])
       colnames(cor_mat)<-drugs
-      dir.create(dir_folder)
-      write.table(cor_mat, file=paste0(dir_folder,"/cors.txt"))
+      dir.create("./calcPhenotype_Output")
+      write.table(cor_mat, file="./calcPhenotype_Output/cors.txt")
 
       names(pvalues)<-drugs
       p_mat<-do.call(cbind, pvalues)
       rownames(p_mat)<-rownames(homData$train[keepRows, NonNAindex])
       colnames(p_mat)<-drugs
-      dir.create(dir_folder)
-      write.table(p_mat, file=paste0(dir_folder,"/pvalues.txt"))
+      dir.create("./calcPhenotype_Output")
+      write.table(p_mat, file="./calcPhenotype_Output/pvalues.txt")
     }
 
   } else {
-    if(report_log){
-      return(list(DrugPredictions_mat, all_logs))
-    }else{
-      return(DrugPredictions_mat)
-    }
+
+    return(DrugPredictions_mat)
 
   }
 

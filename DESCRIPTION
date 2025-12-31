@@ -25,10 +25,10 @@ Description: Allows for building drug response models using screening data betwe
     GLDS - Geeleher et al, Cancer biomarker discovery is improved by accounting for variability in general levels of drug sensitivity in pre-clinical models.
     IDWAS -  Geeleher et al, Discovering novel pharmacogenomic biomarkers by imputing drug response in cancer patients from large genomics studies.
 LazyData: true
-License: GPL-2
+License: GPL (>= 3)
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.1
+RoxygenNote: 7.3.2
 Depends: R (>= 4.1.0)
 biocViews:
     sva,
@@ -61,7 +61,9 @@ Imports:
     BiocGenerics,
     GenomicRanges,
     IRanges,
-    S4Vectors
+    S4Vectors,
+    foreach,
+    doParallel
 Suggests:
     knitr,
     rmarkdown,
